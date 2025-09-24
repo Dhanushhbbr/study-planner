@@ -1,0 +1,450 @@
+"use strict";
+
+/* Smart Study Planner - Full stable script
+   Features:
+   - Add / Edit / Delete tasks (title, subject, notes, due, time, priority)
+   - Persist tasks to localStorage
+   - Active + Completed sections (completed shows "? Task Completed")
+   - Today Summary: scheduled-for-today + created-today counts
+   - Progress bar for scheduled tasks
+   - Calendar view with clickable dates & modal
+   - Filters (subject, priority)
+   - Clear completed
+   - Pomodoro timer (Start, Pause, Reset, cycles persisted)
+   - Analytics (SVG pie)
+   - Soft notification bar (no confirm())
+*/
+
+const STORAGE_KEY = "smart-study-tasks-v1";
+const POMO_CYCLES_KEY = "smart-study-pom-cycles";
+const POMO_REMAIN_KEY = "smart-study-pom-remaining";
+
+let tasks = [];
+try {
+  tasks = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+} catch (e) {
+  console.warn("Failed to parse tasks from storage, resetting.", e);
+  tasks = [];
+  localStorage.removeItem(STORAGE_KEY);
+}
+
+/* --- helpers --- */
+const el = id => document.getElementById(id);
+const tpl = document.getElementById("task-template");
+const taskList = el("task-list");
+const form = el("task-form");
+const filterSubject = el("filter-subject");
+const filterPriority = el("filter-priority");
+const todayCount = el("today-count");
+const progressFill = el("progress-fill");
+const listViewBtn = el("list-view-btn");
+const calViewBtn = el("calendar-view-btn");
+const todayBtn = el("today-btn");
+const clearCompletedBtn = el("clear-completed");
+const startTimerBtn = el("start-timer");
+const pauseTimerBtn = el("pause-timer");
+const resetTimerBtn = el("reset-timer");
+const timerDisplay = el("timer-display");
+const cyclesEl = el("cycles");
+const pieSvg = el("pie");
+const analyticsLegend = el("analytics-legend");
+
+/* Notification bar (soft) */
+function showNotification(msg, type = "info") {
+  let bar = document.getElementById("notif-bar");
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "notif-bar";
+    bar.style.position = "fixed";
+    bar.style.bottom = "20px";
+    bar.style.left = "50%";
+    bar.style.transform = "translateX(-50%)";
+    bar.style.padding = "10px 16px";
+    bar.style.borderRadius = "8px";
+    bar.style.boxShadow = "0 2px 12px rgba(0,0,0,0.12)";
+    bar.style.zIndex = "9999";
+    bar.style.transition = "opacity 0.25s";
+    document.body.appendChild(bar);
+  }
+  bar.textContent = msg;
+  bar.style.background = type === "error" ? "#fee2e2" : "#d1fae5";
+  bar.style.color = type === "error" ? "#b91c1c" : "#065f46";
+  bar.style.opacity = "1";
+  clearTimeout(bar._t);
+  bar._t = setTimeout(() => { bar.style.opacity = "0"; }, 3000);
+}
+
+/* Persistence */
+function saveTasks() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
+}
+
+/* Utility */
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
+function capitalize(s){ return s ? s[0].toUpperCase() + s.slice(1) : s; }
+
+/* Save + re-render */
+function saveAndRender() {
+  saveTasks();
+  populateFilterSubjects();
+  if (listViewBtn.classList.contains("active")) renderTasks(); else renderCalendar();
+  updateTodaySummary();
+  renderAnalytics();
+}
+
+/* === Form: add task === */
+if (form) {
+  form.addEventListener("submit", e => {
+    e.preventDefault();
+    const title = el("title").value.trim();
+    if (!title) { showNotification("Please enter a title", "error"); return; }
+    const newTask = {
+      id: uid(),
+      title,
+      subject: el("subject").value.trim() || "General",
+      notes: el("notes").value.trim() || "",
+      due: el("due").value || null,
+      time: el("due-time").value || null,
+      priority: el("priority").value || "medium",
+      done: false,
+      created: new Date().toISOString()
+    };
+    tasks.push(newTask);
+    form.reset();
+    saveAndRender();
+    showNotification("Task added", "success");
+  });
+  const clearBtn = el("clear-btn");
+  if (clearBtn) clearBtn.addEventListener("click", ()=> form.reset());
+}
+
+/* === Filters === */
+function populateFilterSubjects() {
+  if (!filterSubject) return;
+  const subs = Array.from(new Set(tasks.map(t => t.subject || "General")));
+  const prev = filterSubject.value || "all";
+  filterSubject.innerHTML = '<option value="all">All Subjects</option>';
+  subs.forEach(s => {
+    const o = document.createElement("option");
+    o.value = s; o.textContent = s;
+    filterSubject.appendChild(o);
+  });
+  if ([...filterSubject.options].some(o=>o.value===prev)) filterSubject.value = prev;
+}
+
+/* === Today summary (scheduled + created) === */
+function updateTodaySummary() {
+  const today = new Date().toISOString().slice(0,10);
+  // scheduled for today
+  const scheduled = tasks.filter(t => t.due === today);
+  todayCount.textContent = `${scheduled.length} tasks`;
+  const doneCount = scheduled.filter(t => t.done).length;
+  const pct = scheduled.length ? Math.round((doneCount / scheduled.length) * 100) : 0;
+  if (progressFill) progressFill.style.width = pct + "%";
+
+  // created today (new)
+  const createdToday = tasks.filter(t => (t.created || "").slice(0,10) === today).length;
+  let extra = document.getElementById("created-today");
+  if (!extra) {
+    extra = document.createElement("div");
+    extra.id = "created-today";
+    extra.style.fontSize = "0.85rem";
+    extra.style.color = "#6b7280";
+    todayCount.insertAdjacentElement("afterend", extra);
+  }
+  extra.textContent = `Created Today: ${createdToday} tasks`;
+}
+
+/* === Analytics (SVG pie) === */
+function renderAnalytics() {
+  if (!pieSvg) return;
+  pieSvg.innerHTML = "";
+  analyticsLegend.innerHTML = "";
+  const groups = {};
+  tasks.forEach(t => { if (!t.done) groups[t.subject || "General"] = (groups[t.subject || "General"]||0) + 1; });
+  const entries = Object.entries(groups);
+  if (!entries.length) {
+    const txt = document.createElementNS("http://www.w3.org/2000/svg","text");
+    txt.setAttribute("x","10"); txt.setAttribute("y","20");
+    txt.textContent = "No pending tasks.";
+    pieSvg.appendChild(txt);
+    return;
+  }
+  const colors = ['#6c63ff','#00c2ff','#f97316','#10b981','#ef4444','#8b5cf6','#facc15'];
+  const total = entries.reduce((s,[_k,v])=>s+v,0);
+  let start = 0, i = 0;
+  entries.forEach(([k,v]) => {
+    const slice = (v/total) * Math.PI * 2;
+    const x1 = 100 + 80 * Math.cos(start);
+    const y1 = 100 + 80 * Math.sin(start);
+    const x2 = 100 + 80 * Math.cos(start + slice);
+    const y2 = 100 + 80 * Math.sin(start + slice);
+    const large = slice > Math.PI ? 1 : 0;
+    const path = document.createElementNS("http://www.w3.org/2000/svg","path");
+    path.setAttribute("d", `M100 100 L ${x1} ${y1} A 80 80 0 ${large} 1 ${x2} ${y2} Z`);
+    path.setAttribute("fill", colors[i % colors.length]);
+    pieSvg.appendChild(path);
+
+    // legend
+    const row = document.createElement("div");
+    row.style.display = "flex"; row.style.alignItems = "center"; row.style.gap = "8px"; row.style.margin = "6px 0";
+    const dot = document.createElement("span"); dot.style.width = "12px"; dot.style.height = "12px"; dot.style.background = colors[i % colors.length]; dot.style.display="inline-block"; dot.style.borderRadius="3px";
+    const txt = document.createElement("span"); txt.textContent = `${k}: ${v}`;
+    row.appendChild(dot); row.appendChild(txt);
+    analyticsLegend.appendChild(row);
+
+    start += slice; i++;
+  });
+}
+
+/* === Render tasks (Active + Completed) === */
+function renderTasks() {
+  if (!taskList) return;
+  taskList.innerHTML = "";
+  const active = tasks.filter(t => !t.done);
+  const done = tasks.filter(t => t.done);
+
+  // Active
+  if (!active.length) {
+    const c = document.createElement("div"); c.className="card"; c.style.padding="12px"; c.textContent = "No active tasks.";
+    taskList.appendChild(c);
+  } else {
+    active.forEach(t => {
+      const node = tpl.content.cloneNode(true);
+      const wrapper = node.querySelector(".task");
+      wrapper.dataset.id = t.id;
+      const titleEl = wrapper.querySelector(".task-title");
+      titleEl.textContent = t.title;
+      const due = t.due ? ` • Due ${t.due}${t.time? ' ' + t.time : ''}` : "";
+      wrapper.querySelector(".task-sub").textContent = `${t.subject || "General"} • ${capitalize(t.priority)}${due}`;
+      const chk = wrapper.querySelector(".chk");
+      chk.checked = !!t.done;
+      chk.addEventListener("change", () => toggleComplete(t, chk, wrapper));
+      wrapper.querySelector(".edit").addEventListener("click", () => editTask(t.id));
+      wrapper.querySelector(".delete").addEventListener("click", () => {
+        tasks = tasks.filter(x => x.id !== t.id);
+        saveAndRender();
+        showNotification(`Deleted "${t.title}"`, "error");
+      });
+      taskList.appendChild(node);
+    });
+  }
+
+  // Completed
+  if (done.length) {
+    const header = document.createElement("h3"); header.textContent = "? Completed Tasks"; header.style.marginTop = "12px";
+    taskList.appendChild(header);
+    done.forEach(t => {
+      const div = document.createElement("div"); div.className = "card"; div.style.padding="8px"; div.style.marginBottom="8px";
+      const chk = document.createElement("input"); chk.type = "checkbox"; chk.checked = true;
+      chk.addEventListener("change", () => toggleComplete(t, chk, div));
+      div.appendChild(chk);
+      const span = document.createElement("span"); span.textContent = " " + t.title + ` (${t.subject || "General"})`; span.style.textDecoration = "line-through"; span.style.marginLeft="8px";
+      div.appendChild(span);
+      const msg = document.createElement("div"); msg.textContent = "? Task Completed"; msg.style.color="#10b981"; msg.style.fontSize="0.85rem"; msg.style.marginTop="6px";
+      div.appendChild(msg);
+      taskList.appendChild(div);
+    });
+  }
+}
+
+/* toggle complete - keeps completed message persistent and moves item */
+function toggleComplete(task, checkbox, wrapper) {
+  task.done = !!checkbox.checked;
+  // keep notified flag behavior for future features
+  if (!task.done && task.notified) task.notified = false;
+  saveAndRender();
+  if (task.done) showNotification(`"${task.title}" completed!`, "success");
+  else showNotification(`"${task.title}" moved back to active`, "info");
+}
+
+/* edit */
+function editTask(id) {
+  const t = tasks.find(x => x.id === id);
+  if (!t) { showNotification("Task not found", "error"); return; }
+  el("title").value = t.title;
+  el("subject").value = t.subject;
+  el("notes").value = t.notes;
+  el("due").value = t.due || "";
+  el("due-time").value = t.time || "";
+  el("priority").value = t.priority || "medium";
+  tasks = tasks.filter(x => x.id !== id);
+  saveAndRender();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+/* === Calendar view & modal === */
+function renderCalendar() {
+  if (!taskList) return;
+  taskList.innerHTML = "";
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth();
+  const last = new Date(year, month+1, 0).getDate();
+
+  const grid = document.createElement("div");
+  grid.style.display = "grid"; grid.style.gridTemplateColumns = "repeat(7,1fr)"; grid.style.gap = "6px";
+
+  for (let d=1; d<=last; d++){
+    const cell = document.createElement("div"); cell.className = "card"; cell.style.padding="8px"; cell.style.minHeight="80px";
+    const dateStr = year + "-" + String(month+1).padStart(2,"0") + "-" + String(d).padStart(2,"0");
+    const strong = document.createElement("strong"); strong.textContent = d; cell.appendChild(strong);
+    const dayTasks = tasks.filter(t => t.due === dateStr);
+    if (dayTasks.length) {
+      const elCount = document.createElement("div"); elCount.style.fontSize="0.85rem"; elCount.style.color="#6b7280";
+      elCount.textContent = `${dayTasks.length} task${dayTasks.length>1?'s':''}`;
+      cell.appendChild(elCount);
+    }
+    if (dateStr === new Date().toISOString().slice(0,10)) cell.style.border = "2px solid var(--accent)";
+    cell.addEventListener("click", () => openDayModal(dateStr));
+    grid.appendChild(cell);
+  }
+  taskList.appendChild(grid);
+}
+
+function openDayModal(dateStr) {
+  const modal = document.createElement("div"); modal.style.position="fixed"; modal.style.top="0"; modal.style.left="0"; modal.style.width="100%"; modal.style.height="100%";
+  modal.style.background="rgba(0,0,0,0.6)"; modal.style.display="flex"; modal.style.alignItems="center"; modal.style.justifyContent="center"; modal.style.zIndex="9999";
+
+  const box = document.createElement("div"); box.style.background="#fff"; box.style.padding="18px"; box.style.borderRadius="10px"; box.style.maxWidth="520px"; box.style.width="92%"; box.style.maxHeight="80%"; box.style.overflowY="auto";
+  const h = document.createElement("h3"); h.textContent = "Tasks for " + dateStr; box.appendChild(h);
+
+  const dayTasks = tasks.filter(t => t.due === dateStr);
+  if (!dayTasks.length) {
+    const p = document.createElement("p"); p.textContent = "No tasks for this date."; box.appendChild(p);
+  } else {
+    const rem = dayTasks.filter(t => !t.done);
+    const done = dayTasks.filter(t => t.done);
+    if (rem.length) {
+      const sh = document.createElement("h4"); sh.textContent = "?? Remaining"; box.appendChild(sh);
+      rem.forEach(t => {
+        const item = document.createElement("div"); item.style.marginBottom="8px";
+        const chk = document.createElement("input"); chk.type = "checkbox"; chk.checked = t.done;
+        chk.addEventListener("change", () => toggleComplete(t, chk));
+        item.appendChild(chk);
+        const sp = document.createElement("span"); sp.textContent = " " + t.title + " (" + t.priority + ")"; sp.style.marginLeft="8px";
+        item.appendChild(sp);
+        box.appendChild(item);
+      });
+    }
+    if (done.length) {
+      const sh = document.createElement("h4"); sh.textContent = "? Completed"; box.appendChild(sh);
+      done.forEach(t => {
+        const item = document.createElement("div"); item.style.marginBottom="8px";
+        const chk = document.createElement("input"); chk.type = "checkbox"; chk.checked = true;
+        chk.addEventListener("change", () => toggleComplete(t, chk));
+        item.appendChild(chk);
+        const sp = document.createElement("span"); sp.textContent = " " + t.title; sp.style.marginLeft="8px"; sp.style.textDecoration="line-through";
+        item.appendChild(sp);
+        box.appendChild(item);
+      });
+    }
+  }
+
+  const close = document.createElement("button"); close.textContent = "Close"; close.style.marginTop="10px"; close.addEventListener("click", ()=> modal.remove());
+  box.appendChild(close);
+  modal.appendChild(box);
+  document.body.appendChild(modal);
+}
+
+/* === View toggles === */
+if (listViewBtn) listViewBtn.addEventListener("click", ()=> { listViewBtn.classList.add("active"); calViewBtn.classList.remove("active"); renderTasks(); });
+if (calViewBtn) calViewBtn.addEventListener("click", ()=> { calViewBtn.classList.add("active"); listViewBtn.classList.remove("active"); renderCalendar(); });
+if (todayBtn) todayBtn.addEventListener("click", ()=> {
+  const today = new Date().toISOString().slice(0,10);
+  if (listViewBtn.classList.contains("active")) renderTasks(tasks.filter(t => t.due === today));
+  else { renderCalendar(); showNotification("Jumped to today in calendar"); }
+});
+
+/* === Clear completed === */
+if (clearCompletedBtn) clearCompletedBtn.addEventListener("click", () => {
+  tasks = tasks.filter(t => !t.done);
+  saveAndRender();
+  showNotification("Cleared completed tasks", "success");
+});
+
+/* === Pomodoro Timer === */
+let pomoSeconds = parseInt(localStorage.getItem(POMO_REMAIN_KEY) || (25*60), 10);
+let pomoTimer = null;
+let pomoCycles = parseInt(localStorage.getItem(POMO_CYCLES_KEY) || "0", 10);
+
+function updatePomUI() {
+  if (timerDisplay) {
+    const m = String(Math.floor(pomoSeconds/60)).padStart(2,"0");
+    const s = String(pomoSeconds%60).padStart(2,"0");
+    timerDisplay.textContent = `${m}:${s}`;
+  }
+  if (cyclesEl) cyclesEl.textContent = pomoCycles;
+  localStorage.setItem(POMO_REMAIN_KEY, String(pomoSeconds));
+  localStorage.setItem(POMO_CYCLES_KEY, String(pomoCycles));
+}
+
+function startPomodoro() {
+  if (pomoTimer) return;
+  pomoTimer = setInterval(() => {
+    pomoSeconds--;
+    if (pomoSeconds <= 0) {
+      clearInterval(pomoTimer); pomoTimer = null;
+      pomoCycles++;
+      pomoSeconds = 25*60;
+      showNotification("? Pomodoro complete!", "success");
+    }
+    updatePomUI();
+  }, 1000);
+}
+
+function pausePomodoro() { if (pomoTimer) { clearInterval(pomoTimer); pomoTimer = null; } }
+function resetPomodoro() { if (pomoTimer) { clearInterval(pomoTimer); pomoTimer = null; } pomoSeconds = 25*60; updatePomUI(); }
+
+if (startTimerBtn) startTimerBtn.addEventListener("click", startPomodoro);
+if (pauseTimerBtn) pauseTimerBtn.addEventListener("click", pausePomodoro);
+if (resetTimerBtn) resetTimerBtn.addEventListener("click", resetPomodoro);
+
+/* === Initialization === */
+document.addEventListener("DOMContentLoaded", () => {
+  if (filterSubject) filterSubject.addEventListener("change", () => saveAndRender());
+  if (filterPriority) filterPriority.addEventListener("change", () => saveAndRender());
+  updatePomUI();
+  saveAndRender();
+});
+/* === Enhancements === */
+
+// Patch Pomodoro controls to show action messages
+if (startTimerBtn) startTimerBtn.addEventListener("click", () => { 
+  startPomodoro(); 
+  showNotification("Pomodoro started","success"); 
+});
+if (pauseTimerBtn) pauseTimerBtn.addEventListener("click", () => { 
+  pausePomodoro(); 
+  showNotification("Pomodoro paused","info"); 
+});
+if (resetTimerBtn) resetTimerBtn.addEventListener("click", () => { 
+  resetPomodoro(); 
+  showNotification("Pomodoro reset","info"); 
+});
+
+// Undo Clear Completed
+let lastCleared = [];
+if (clearCompletedBtn) clearCompletedBtn.addEventListener("click", () => {
+  lastCleared = tasks.filter(t => t.done);
+  tasks = tasks.filter(t => !t.done);
+  saveAndRender();
+  showNotification("Cleared completed tasks","success");
+
+  // Show Undo button
+  let undoBtn = document.getElementById("undo-clear");
+  if (!undoBtn){
+    undoBtn = document.createElement("button");
+    undoBtn.id = "undo-clear";
+    undoBtn.textContent = "Undo Clear";
+    undoBtn.style.marginTop = "8px";
+    clearCompletedBtn.insertAdjacentElement("afterend", undoBtn);
+    undoBtn.addEventListener("click", () => {
+      tasks = tasks.concat(lastCleared);
+      lastCleared = [];
+      saveAndRender();
+      showNotification("Restored cleared tasks","success");
+      undoBtn.remove();
+    });
+  }
+});
